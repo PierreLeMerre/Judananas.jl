@@ -216,6 +216,79 @@ end
     g = TsGroup([[0.9, 1.1], [1.05]])
     out = compute_perievent(g, Ts([1.0]), 0.2)
     @test length(out) == 2 && times(out[2][1]) ≈ [0.05]
+
+    # a vector of events keeps its order (e.g. trials sorted by type)
+    pe = compute_perievent(x, [5.0, 1.0], (-0.2, 0.3))
+    @test pe[:event_time] == [5.0, 1.0]
+    @test times(pe[1]) ≈ [0.0, 0.2] && times(pe[2]) ≈ [-0.1, 0.1]
+
+    # an IntervalSet of trials: aligned on starts, trial metadata copied
+    trials = IntervalSet([5.0, 1.0], [6.0, 2.0]; trial_type = ["B", "A"], rate = [1, 2])
+    pe = compute_perievent(x, trials, (-0.2, 0.3))
+    @test pe[:event_time] == [1.0, 5.0] && pe[:event_stop] == [2.0, 6.0]
+    @test pe[:trial_type] == ["A", "B"] && pe[:trial_rate] == [2, 1]
+    @test times(pe[1]) ≈ [-0.1, 0.1]
+    @test length(compute_perievent(g, trials, 0.2)) == 2
+end
+
+@testset "selection by id" begin
+    g = TsGroup([[1.0], [2.0, 3.0], [4.0]]; ids = [185, 228, 7], location = ["CA1", "DG", "CA1"])
+    @test times(g[id = 228]) == [2.0, 3.0]
+    @test ids(g[id = [7, 185]]) == [7, 185]
+    @test g[:location, id = 7] == "CA1"
+    @test g[:location, id = [228, 7]] == ["DG", "CA1"]
+    @test g[:location] == ["CA1", "DG", "CA1"]
+    @test indexof(g, 7) == 3 && indexof(g, [228, 185]) == [2, 1]
+    m = metadata(g, 228)
+    @test m.id == 228 && m.location == "DG" && m.rate ≈ 2 / 3
+    @test metadata(g, :location, 185) == "CA1"
+    @test_throws KeyError g[id = 999]
+    @test_throws KeyError indexof(g, 999)
+end
+
+@testset "metadata tables" begin
+    g = TsGroup([[1.0], [2.0, 3.0], [4.0]]; ids = [185, 228, 7], location = ["CA1", "DG", "CA1"])
+    t = metadata_table(g)
+    @test keys(t) == (:id, :location, :rate)
+    @test t.id == [185, 228, 7] && t.location == ["CA1", "DG", "CA1"]
+    @test value_counts(g, :location) == ["CA1" => 2, "DG" => 1]
+
+    ep = IntervalSet([0, 10], [5, 15]; cond = ["A", "A"])
+    @test metadata_table(ep) == (start = [0.0, 10.0], stop = [5.0, 15.0], cond = ["A", "A"])
+    @test value_counts(ep, :cond) == ["A" => 2]
+end
+
+@testset "rate, time_diff, ISI distribution" begin
+    x = Ts([1.0, 2.0, 4.0, 7.0]; time_support = IntervalSet(0, 10))
+    @test rate(x) == 0.4
+    @test rate(restrict(x, 0, 2.5)) == 2 / 2.5
+    @test isnan(rate(Ts(Float64[])))
+
+    d = time_diff(x)
+    @test values(d) == [1.0, 2.0, 3.0]
+    @test times(d) == [1.5, 3.0, 5.5]
+    @test time_support(d) == time_support(x)
+    @test times(time_diff(x; align = :start)) == [1.0, 2.0, 4.0]
+    @test times(time_diff(x; align = :end)) == [2.0, 4.0, 7.0]
+    @test_throws ArgumentError time_diff(x; align = :middle)
+    # no interval across the gap between two epochs
+    y = Ts([1.0, 2.0, 11.0, 13.0]; time_support = IntervalSet([0, 10], [5, 15]))
+    @test values(time_diff(y)) == [1.0, 2.0]
+
+    h = compute_isi_distribution(x; bins = [0, 1.5, 2.5, 3])
+    @test h.counts == [1, 1, 1]                      # last bin includes its right edge
+    @test h.centers == [0.75, 2.0, 2.75]
+    h = compute_isi_distribution(x; bins = 2)
+    @test h.edges == [1.0, 2.0, 3.0] && h.counts == [1, 2]
+    h = compute_isi_distribution(x; bins = 2, log_scale = true)
+    @test h.edges ≈ [1.0, sqrt(3), 3.0] && h.counts == [1, 2]
+    @test h.centers ≈ sqrt.(h.edges[1:end-1] .* h.edges[2:end])
+
+    g = TsGroup([[0.0, 1.0, 3.0], [0.0, 0.5]])
+    h = compute_isi_distribution(g; bins = [0, 1, 2, 3])
+    @test size(h.counts) == (3, 2)
+    @test h.counts[:, 1] == [0, 1, 1] && h.counts[:, 2] == [1, 0, 0]
+    @test_throws ArgumentError compute_isi_distribution(x; bins = [1.0])
 end
 
 @testset "plot recipes" begin
@@ -240,6 +313,20 @@ end
     @test r.args[1] == [0, 1, 5, 6] && r.plotattributes[:seriestype] == :vspan
 
     @test recipe(Ts([1.0, 2.0])).args[1] == [1.0, 2.0]
+
+    # rasters: "Unit" rows, or "Trial" rows after compute_perievent
+    @test recipe(g).plotattributes[:yguide] == "Unit"
+    pe = compute_perievent(Ts([0.9, 1.1, 2.0]), [1.0, 2.0], 0.5)
+    @test recipe(pe).plotattributes[:yguide] == "Trial"
+
+    # `color` colours the ticks, one colour or one per row
+    colored(x, c) = RecipesBase.apply_recipe(Dict{Symbol,Any}(:seriescolor => c), x)[1].plotattributes
+    a = colored(g, :red)
+    @test a[:markercolor] == :red && a[:markerstrokecolor] == :red
+    a = colored(g, [:red, :blue])
+    @test a[:markercolor] == [:red, :red, :blue] && a[:markerstrokecolor] == [:red, :red, :blue]
+    @test recipe(g).plotattributes[:markercolor] == :black
+    @test colored(Ts([1.0]), :blue)[:markerstrokecolor] == :blue
 end
 
 @testset "load_file (NWB)" begin
@@ -264,6 +351,8 @@ end
         u["rate"] = [7.0, 8.0, 9.0]                            # clashes with computed :rate
         u["tags"] = ["a", "b", "c", "d"]                       # ragged column
         u["tags_index"] = [1, 3, 4]
+        u["waveform_means"] = rand(5, 3)                       # skipped by name
+        u["big"] = rand(1000, 3)                               # 8 kB per unit, 24 kB in all
 
         tr = nd(create_group(f, "intervals/trials"), "TimeIntervals")
         tr["id"] = Int32[0, 1]
@@ -323,8 +412,20 @@ end
     @test values(restrict(lfp, 2.0005, 2.0025)) == [2 12; 3 13]
     @test values(data["EMG/ElectricalSeries"])[1, 1] == 100
 
+    @test !haskey(metadata(g), :waveform_means)
+    @test length(g[:big][1]) == 1000                               # under the size limit
+
+    # large columns are skipped, and so are the ones asked for
+    small = @test_logs (:info, r"column `big` skipped") load_file(path; max_column_bytes = 10_000)["units"]
+    @test !haskey(metadata(small), :big) && haskey(metadata(small), :tags)
+    some = load_file(path; skip_columns = ["tags", "x"])["units"]
+    @test !haskey(metadata(some), :tags) && !haskey(metadata(some), :x)
+    @test haskey(metadata(some), :location)
+    @test !haskey(metadata(load_file(path; skip_columns = ["sound"])["trials"]), :sound)
+
     @test_throws KeyError data["nope"]
     @test_throws ArgumentError load_file(joinpath(mktempdir(), "missing.nwb"))
+    @test Judananas._escape_query("sub-1/a_b+c d.nwb") == "sub-1/a_b%2Bc%20d.nwb"
 end
 
 @testset "display" begin

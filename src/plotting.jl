@@ -41,8 +41,9 @@ end
     seriestype --> :scatter
     markershape --> :vline
     markersize --> 10
-    markercolor --> :black
-    markerstrokecolor --> :black
+    c = get(plotattributes, :seriescolor, :black)    # `color` colours the ticks
+    markercolor --> c
+    markerstrokecolor --> c
     legend --> false
     yticks --> false
     ylims --> (0.5, 1.5)
@@ -50,7 +51,11 @@ end
     x.t, ones(length(x.t))
 end
 
-# Raster: one row per unit (or per trial after compute_perievent).
+# Raster: one row per unit (or per trial after compute_perievent, recognised by
+# its :event_time metadata).
+#
+# `color` colours the ticks: one colour for the whole raster, or a vector with one
+# colour per row (e.g. by trial type). `yflip = true` puts the first row on top.
 @recipe function f(g::TsGroup)
     n = length(g)
     xs = reduce(vcat, (u.t for u in g.units); init = Float64[])
@@ -58,11 +63,17 @@ end
     seriestype --> :scatter
     markershape --> :vline
     markersize --> max(2, min(8, 300 / max(n, 1)))
-    markercolor --> :black
-    markerstrokecolor --> :black
+    c = get(plotattributes, :seriescolor, :black)
+    if c isa AbstractVector && length(c) == n && n > 0
+        c = reduce(vcat, (fill(c[i], length(u)) for (i, u) in enumerate(g.units)); init = eltype(c)[])
+        seriescolor := :black      # per-spike colours go to the markers
+    end
+    # vline markers are drawn with their stroke, so both colours follow `color`
+    markercolor --> c
+    markerstrokecolor --> c
     legend --> false
     xguide --> "Time (s)"
-    yguide --> "Unit"
+    yguide --> (haskey(g.metadata, :event_time) ? "Trial" : "Unit")
     ylims --> (0.5, n + 0.5)
     if 0 < n <= 30
         yticks --> (1:n, string.(g.ids))

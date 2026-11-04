@@ -19,6 +19,16 @@ The `:rate` field (spikes / s over the time support) is computed automatically
 and updated by `restrict`.
 
 Indexing is positional: `g[3]` is the third unit, whatever its id.
+To select by unit id, use the `id` keyword:
+
+```julia
+g[id = 185]                 # the Ts of unit 185
+g[id = [185, 228]]          # a TsGroup with these two units
+g[:location, id = 185]      # one metadata value
+metadata(g, 185)            # all metadata of unit 185, as a NamedTuple
+indexof(g, 185)             # position of unit 185 in g
+```
+
 Use `filter` to select units from their metadata:
 
 ```julia
@@ -93,7 +103,33 @@ function Base.getindex(g::TsGroup, idx::AbstractVector)
     md = Metadata(k => v[idx] for (k, v) in g.metadata)
     return TsGroup(g.units[idx], g.ids[idx], md, g.time_support, Val(:unchecked))
 end
-Base.getindex(g::TsGroup, k::Symbol) = g.metadata[k]
+# selection by unit id: g[id = 185], g[id = [185, 228]], g[:location, id = 185]
+Base.getindex(g::TsGroup; id) = g[indexof(g, id)]
+Base.getindex(g::TsGroup, k::Symbol; id = nothing) =
+    id === nothing ? g.metadata[k] : g.metadata[k][indexof(g, id)]
+
+"""
+    indexof(g::TsGroup, id) -> Int
+    indexof(g::TsGroup, ids::AbstractVector) -> Vector{Int}
+
+Position of the unit(s) with the given id(s) in `g`, so that `g[indexof(g, id)]`
+is unit `id`. Throws a `KeyError` for an unknown id.
+"""
+function indexof(g::TsGroup, id::Integer)
+    i = findfirst(==(id), g.ids)
+    i === nothing && throw(KeyError(id))
+    return i
+end
+indexof(g::TsGroup, ids::AbstractVector) = [indexof(g, i) for i in ids]
+
+"""
+    metadata(g::TsGroup)               # Dict field => vector
+    metadata(g::TsGroup, id)           # NamedTuple: id and every field of unit `id`
+    metadata(g::TsGroup, key, id)      # one field of unit `id` (or a vector, for several ids)
+"""
+metadata(g::TsGroup, id::Integer) = _row(g, indexof(g, id))
+metadata(g::TsGroup, key::Symbol, id) = g[key, id = id]
+
 function Base.setindex!(g::TsGroup, v::AbstractVector, k::Symbol)
     k == :rate && throw(ArgumentError(":rate is computed automatically"))
     length(v) == length(g) || throw(DimensionMismatch("metadata length must match"))
@@ -114,6 +150,49 @@ Keep the units for which `f(row)` is true. `row` is a NamedTuple with the unit
 `id` and every metadata field, e.g. `filter(u -> u.rate > 2, g)`.
 """
 Base.filter(f, g::TsGroup) = g[[i for i in 1:length(g) if f(_row(g, i))]]
+
+# --- metadata as a table ---------------------------------------------------
+
+"""
+    metadata_table(g::TsGroup)
+    metadata_table(ep::IntervalSet)
+
+The metadata as a NamedTuple of column vectors: `id` then the fields in alphabetical
+order for a `TsGroup`, `start`, `stop` then the fields for an `IntervalSet`.
+A NamedTuple of vectors is a Tables.jl table, so `DataFrame(metadata_table(g))` works.
+"""
+function metadata_table(g::TsGroup)
+    ks = sort!(collect(keys(g.metadata)))
+    return NamedTuple{(:id, ks...)}((g.ids, (g.metadata[k] for k in ks)...))
+end
+
+function metadata_table(ep::IntervalSet)
+    ks = sort!(collect(keys(ep.metadata)))
+    return NamedTuple{(:start, :stop, ks...)}((ep.start, ep.stop, (ep.metadata[k] for k in ks)...))
+end
+
+"""
+    value_counts(g::TsGroup, key)
+    value_counts(ep::IntervalSet, key)
+
+How many units (or epochs) take each value of the metadata field `key`, like pandas'
+`value_counts`: a vector of `value => count` pairs, most frequent first.
+
+```julia
+value_counts(units, :location)    # ["CA1" => 120, "DG" => 45, ...]
+```
+"""
+value_counts(g::Union{TsGroup,IntervalSet}, key::Symbol) = _value_counts(g[key])
+
+function _value_counts(v::AbstractVector)
+    c = Dict{eltype(v),Int}()
+    for x in v
+        c[x] = get(c, x, 0) + 1
+    end
+    p = collect(c)
+    sort!(p; by = x -> (-x.second, string(x.first)))
+    return p
+end
 
 # --- display ---------------------------------------------------------------
 

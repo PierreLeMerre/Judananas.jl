@@ -41,6 +41,11 @@ lfp    = data["LFP/ElectricalSeries"]
 - Every numeric `TimeSeries` becomes a `Tsd` with time on the first dimension. Uncompressed data is
   memory-mapped, so a 10 GB LFP is only read where you index or `restrict` it.
 - Data is returned as stored, without applying `conversion`.
+- Per-unit waveforms (`waveform_mean(s)`, `waveform_sd(s)`) are never read, and table columns over
+  50 MB are skipped with a message: `load_file(path; skip_columns = ["..."], max_column_bytes = Inf)`.
+- `dandi_url(dandiset, asset_path; version = "draft")` gives the S3 URL of a DANDI file.
+  `load_file(url)` streams it with HDF5's ROS3 driver (experimental: it needs `HDF5.has_ros3()`,
+  e.g. HDF5_jll 2.2, and hung on macOS in the only test so far).
 
 ## Operations
 
@@ -51,8 +56,13 @@ lfp    = data["LFP/ElectricalSeries"]
 - `bin_average(tsd, bin_size)`
 - `value_from(ts, tsd)`: the closest sample of `tsd` at each event, e.g. position at each spike
 - `threshold(tsd, thr; method = :above)`: the support becomes the passing epochs
-- `compute_perievent(ts_or_group, events, (before, after))`
+- `compute_perievent(ts_or_group, events, (before, after))`: events are a vector (order kept),
+  a `Ts`, or an `IntervalSet` of trials (aligned on starts, trial metadata copied)
+- `rate(ts)`, `time_diff(ts)` (ISIs as a `Tsd`), `compute_isi_distribution(ts_or_group; bins, log_scale)`
 - `filter(u -> u.location == "PFC" && u.rate > 1, group)`
+- by unit id: `group[id = 185]`, `group[id = [185, 228]]`, `group[:location, id = 185]`,
+  `metadata(group, 185)`, `indexof(group, 185)`
+- `value_counts(group, :location)`, `metadata_table(group)` (a Tables.jl table: `DataFrame(metadata_table(group))`)
 - `to_tsd(group)`: all spikes in one `Tsd`, with unit ids as values
 
 ## Plotting
@@ -64,7 +74,8 @@ using Judananas, Plots
 plot(group)              # raster
 plot!(epochs)            # shaded epochs
 plot(tsd)                # traces, broken across epochs
-plot(compute_perievent(group[1], onsets, (-0.5, 1)))   # trial raster
+plot(compute_perievent(group[1], onsets, (-0.5, 1)))   # trial raster, rows labelled "Trial"
+plot(pe; color = colors_per_trial, yflip = true)       # coloured ticks, first trial on top
 ```
 
 ## Design decisions
@@ -74,7 +85,8 @@ plot(compute_perievent(group[1], onsets, (-0.5, 1)))   # trial raster
 - Interval algebra (`intersect`, `union`, `setdiff`) drops metadata.
 - In `count` and `bin_average`, bins start at each epoch's start and an incomplete last bin is dropped.
   Bins are `[left, right)`, except the last bin of an epoch, which includes the epoch's right edge.
-- `TsGroup` indexing is positional (`g[3]` is the third unit), and `ids(g)` gives the unit ids.
+- `TsGroup` indexing is positional (`g[3]` is the third unit), and `ids(g)` gives the unit ids;
+  `g[id = 185]` selects by id.
 
 ## Status
 

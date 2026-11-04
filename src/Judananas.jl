@@ -23,13 +23,16 @@ module Judananas
 
 using Statistics: mean
 using RecipesBase
+using Downloads
 
 export IntervalSet, Ts, Tsd, TsGroup
 export starts, stops, tot_length, merge_close_intervals,
        drop_short_intervals, drop_long_intervals
-export times, time_support, restrict, columns, ids, metadata, rates
-export bin_average, value_from, threshold, compute_perievent, to_tsd
-export load_file, NWBFile
+export times, time_support, restrict, columns, ids, metadata, rates, rate, indexof
+export metadata_table, value_counts
+export bin_average, value_from, threshold, compute_perievent, to_tsd,
+       time_diff, compute_isi_distribution
+export load_file, NWBFile, dandi_url
 
 const Metadata = Dict{Symbol,Vector}
 

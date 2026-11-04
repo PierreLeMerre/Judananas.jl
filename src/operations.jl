@@ -33,6 +33,120 @@ end
 
 restrict(x, start::Real, stop::Real) = restrict(x, IntervalSet(start, stop))
 
+# --- rate and inter-event intervals ------------------------------------------
+
+"""
+    rate(x::Ts)
+
+Event rate over the time support: `length(x) / tot_length(time_support(x))`, in events / s
+(pynapple's `Ts.rate`). `NaN` for an empty support. After `restrict(x, ep)`, this is the
+rate inside `ep`. For a `TsGroup`, see `rates`.
+"""
+function rate(x::Ts)
+    T = tot_length(x.time_support)
+    return T > 0 ? length(x) / T : NaN
+end
+
+"""
+    time_diff(x::Ts; align = :center, epochs = time_support(x))
+
+Intervals between consecutive events (ISIs, for a spike train), as a `Tsd` (pynapple's
+`Ts.time_diff`). Each interval is timed at the middle of the two events (`align = :center`),
+at the first one (`:start`) or at the second one (`:end`).
+
+Intervals are computed inside each epoch of `epochs`, never across a gap between epochs.
+"""
+function time_diff(x::Ts; align::Symbol = :center, epochs::IntervalSet = x.time_support)
+    align in (:center, :start, :end) ||
+        throw(ArgumentError("align must be :center, :start or :end"))
+    t, d = Float64[], Float64[]
+    for (s, e) in epochs
+        lo, hi = searchsortedfirst(x.t, s), searchsortedlast(x.t, e)
+        for k in lo:hi-1
+            a, b = x.t[k], x.t[k+1]
+            push!(t, align === :center ? (a + b) / 2 : align === :start ? a : b)
+            push!(d, b - a)
+        end
+    end
+    return Tsd(t, d, String[], epochs, Val(:unchecked))
+end
+
+_isis(x::Ts, ep) = values(time_diff(x; epochs = ep))
+
+function _isi_edges(bins::Integer, isis, log_scale::Bool)
+    bins > 0 || throw(ArgumentError("bins must be positive"))
+    all_isi = reduce(vcat, isis; init = Float64[])
+    log_scale && (all_isi = filter(>(0), all_isi))
+    isempty(all_isi) && return collect(range(0.0, 1.0; length = bins + 1))
+    lo, hi = extrema(all_isi)
+    if log_scale
+        lo == hi && (lo /= 10; hi *= 10)
+        return exp10.(range(log10(lo), log10(hi); length = bins + 1))
+    end
+    lo == hi && (lo -= 0.5; hi += 0.5)
+    return collect(range(lo, hi; length = bins + 1))
+end
+function _isi_edges(bins::AbstractVector{<:Real}, _, _)
+    length(bins) >= 2 && issorted(bins) ||
+        throw(ArgumentError("bin edges must be sorted, with at least 2 edges"))
+    return collect(Float64, bins)
+end
+
+# counts of `v` in bins [e[i], e[i+1]); the last bin includes its right edge (like numpy)
+function _histogram(v, edges)
+    c = zeros(Int, length(edges) - 1)
+    for x in v
+        (x < edges[1] || x > edges[end]) && continue
+        i = min(searchsortedlast(edges, x), length(c))
+        c[i] += 1
+    end
+    return c
+end
+
+"""
+    compute_isi_distribution(x::Ts; bins = 10, log_scale = false, epochs = time_support(x))
+    compute_isi_distribution(g::TsGroup; bins = 10, log_scale = false, epochs = time_support(g))
+
+Histogram of inter-spike intervals (pynapple's `nap.compute_isi_distribution`).
+ISIs are computed inside each epoch of `epochs`.
+
+- `bins`: a number of bins spanning the shortest to the longest ISI (of all units, for a
+  `TsGroup`), or a vector of bin edges in seconds.
+- `log_scale = true`: with an integer `bins`, the bins are log-spaced (equal width in
+  log10(ISI)), the usual choice for ISI distributions. Ignored when edges are given;
+  pass `exp10.(range(-3, 1; length = 41))` for explicit log-spaced edges.
+
+Returns a NamedTuple `(edges, centers, counts)`: `counts` is a vector for a `Ts` and a
+matrix (bins × units, in the order of `ids(g)`) for a `TsGroup`. `centers` are the
+arithmetic bin centers, or the geometric ones with `log_scale`. Bins are `[left, right)`,
+except the last one which includes its right edge.
+
+```julia
+h = compute_isi_distribution(g[id = 185]; bins = 50, log_scale = true)
+plot(h.centers, h.counts; xscale = :log10)
+```
+"""
+function compute_isi_distribution(x::Ts; bins = 10, log_scale::Bool = false,
+                                  epochs::IntervalSet = x.time_support)
+    isi = _isis(x, epochs)
+    edges = _isi_edges(bins, [isi], log_scale)
+    return (edges = edges, centers = _centers(edges, log_scale && bins isa Integer),
+            counts = _histogram(isi, edges))
+end
+
+function compute_isi_distribution(g::TsGroup; bins = 10, log_scale::Bool = false,
+                                  epochs::IntervalSet = g.time_support)
+    isis = [_isis(u, epochs) for u in g.units]
+    edges = _isi_edges(bins, isis, log_scale)
+    c = zeros(Int, length(edges) - 1, length(g))
+    for (j, isi) in enumerate(isis)
+        c[:, j] = _histogram(isi, edges)
+    end
+    return (edges = edges, centers = _centers(edges, log_scale && bins isa Integer), counts = c)
+end
+
+_centers(e, geometric) = geometric ? sqrt.(e[1:end-1] .* e[2:end]) : (e[1:end-1] .+ e[2:end]) ./ 2
+
 # --- binning ---------------------------------------------------------------
 
 # For each epoch: (start, number of full bins). Partial bins at the end of an
@@ -210,18 +324,39 @@ _window(w::Real) = (-Float64(w), Float64(w))
 _window(w::Tuple{Real,Real}) = (Float64(w[1]), Float64(w[2]))
 _event_times(ev::Ts) = ev.t
 _event_times(ev::AbstractVector{<:Real}) = collect(Float64, ev)
+_event_times(ev::IntervalSet) = copy(ev.start)
+
+# trial metadata copied from an IntervalSet of trials (fields that clash with the
+# perievent fields are prefixed with `trial_`)
+_event_metadata(ev) = Dict{Symbol,Vector}()
+function _event_metadata(ev::IntervalSet)
+    md = Dict{Symbol,Vector}()
+    for (k, v) in ev.metadata
+        md[k in (:rate, :event_time) ? Symbol(:trial_, k) : k] = copy(v)
+    end
+    md[:event_stop] = copy(ev.stop)
+    return md
+end
 
 """
     compute_perievent(x::Ts, events, window)
     compute_perievent(g::TsGroup, events, window)
 
-Align spikes to each event. `events` is a `Ts` or a vector of times;
-`window` is `(before, after)` relative to the event, e.g. `(-0.5, 1.0)`,
-or a single number `w` for `(-w, w)`.
+Align spikes to each event. `window` is `(before, after)` relative to the event,
+e.g. `(-0.5, 1.0)`, or a single number `w` for `(-w, w)`. `events` is
 
-For a `Ts`, returns a `TsGroup` with one trial per event (times relative to
-the event, time support = the window, metadata `:event_time`).
+- a vector of times: trials keep the order of the vector, so you can sort the
+  events (by trial type, reaction time...) before aligning;
+- a `Ts`: trials are in chronological order (a `Ts` is always sorted);
+- an `IntervalSet` of trials: events are the trial starts, and every trial metadata
+  field (e.g. `:trial_type`) is copied to the result, along with `:event_stop`.
+
+For a `Ts`, returns a `TsGroup` with one trial per event (ids `1:n`, times relative
+to the event, time support = the window, metadata `:event_time`).
 For a `TsGroup`, returns a vector of such groups, one per unit.
+
+The raster recipe labels the rows of such a group "Trial" (it recognises the
+`:event_time` metadata). `plot(pe; yflip = true)` puts the first trial on top.
 """
 function compute_perievent(x::Ts, events, window)
     w1, w2 = _window(window)
@@ -234,7 +369,8 @@ function compute_perievent(x::Ts, events, window)
         # clamp guards against rounding pushing edge spikes outside the window
         trials[i] = clamp.(x.t[lo:hi] .- e, w1, w2)
     end
-    return TsGroup(trials; time_support = IntervalSet(w1, w2), event_time = ev)
+    return TsGroup(trials; time_support = IntervalSet(w1, w2), event_time = ev,
+                   pairs(_event_metadata(events))...)
 end
 
 compute_perievent(g::TsGroup, events, window) =

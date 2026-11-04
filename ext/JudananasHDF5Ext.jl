@@ -11,9 +11,24 @@ _readstr(f, k, default = "") = haskey(f, k) ? string(read(f[k])) : default
 
 # ---------------------------------------------------------------- scanning
 
-function load_nwb(path::String)
-    isfile(path) || throw(ArgumentError("no such file: $path"))
-    h5open(path, "r") do f
+_is_remote(path) = occursin(r"^(https?|s3)://", path)
+
+# ROS3 (read-only S3) driver for remote files; DANDI's bucket is in us-east-2
+function _open(path, opts)
+    _is_remote(path) || return h5open(path, "r")
+    HDF5.has_ros3() || error("streaming needs an HDF5 library built with the ROS3 driver; ",
+        "HDF5_jll >= 2.2 has it: `Pkg.add(name = \"HDF5_jll\", version = \"2.2\")`")
+    driver = HDF5.Drivers.ROS3(Int32(1), false, opts.region, "", "")
+    return h5open(path, "r"; driver = driver)
+end
+
+function load_nwb(path::String; skip_columns = (), max_column_bytes::Real = 50_000_000,
+                  region::AbstractString = "us-east-2")
+    _is_remote(path) || isfile(path) || throw(ArgumentError("no such file: $path"))
+    opts = (skip_columns = Tuple(String.(collect(skip_columns))),
+            max_column_bytes = max_column_bytes, region = String(region),
+            remote = _is_remote(path))
+    _open_do(path, opts) do f
         found = Tuple{String,Symbol,String}[]          # (name, kind, h5path)
         for k in keys(f)
             k in SKIP_TOP && continue
@@ -23,7 +38,16 @@ function load_nwb(path::String)
         order = Dict(:units => 1, :intervals => 2, :timeseries => 3)
         entries = sort(_make_keys(found), by = e -> order[e[2]])   # stable: file order within a kind
         NWBFile(path, _readstr(f, "identifier", basename(path)),
-                _readstr(f, "session_description"), entries, Dict{String,Any}())
+                _readstr(f, "session_description"), entries, Dict{String,Any}(), opts)
+    end
+end
+
+function _open_do(f, path, opts)
+    h = _open(path, opts)
+    try
+        return f(h)
+    finally
+        close(h)
     end
 end
 
@@ -63,12 +87,12 @@ end
 
 # ---------------------------------------------------------------- loading
 
-function load_entry(path, kind::Symbol, h5path::String)
-    h5open(path, "r") do f
+function load_entry(path, kind::Symbol, h5path::String, opts)
+    _open_do(path, opts) do f
         g = f[h5path]
-        kind === :units      && return _load_units(f, g)
-        kind === :intervals  && return _load_intervals(g)
-        kind === :timeseries && return _load_timeseries(g)
+        kind === :units      && return _load_units(f, g, opts)
+        kind === :intervals  && return _load_intervals(g, opts)
+        kind === :timeseries && return _load_timeseries(g, opts)
         error("unknown kind $kind")
     end
 end
@@ -76,15 +100,23 @@ end
 # Read the columns of a DynamicTable with `n` rows (HDF5.jl reverses dims, so
 # the row dimension is the last one). Ragged columns (`x` + `x_index`) become
 # vectors of vectors, matrix columns become one vector per row. Columns that
-# cannot be read (object references, compound types) are skipped.
-function _table_columns(g, n; skip = ())
+# cannot be read (object references, compound types) are skipped, and so are
+# columns larger than `max_bytes` (e.g. per-unit mean waveforms), with a message.
+function _table_columns(g, n; skip = (), max_bytes::Real = Inf)
     md = Dict{Symbol,Vector}()
     for k in keys(g)
         (k in skip || endswith(k, "_index")) && continue
         ds = g[k]
         ds isa HDF5.Dataset || continue
         try
-            eltype(ds) <: HDF5.Reference && continue
+            T = eltype(ds)
+            T <: HDF5.Reference && continue
+            nbytes = isbitstype(T) ? length(ds) * sizeof(T) : 0
+            if nbytes > max_bytes
+                @info "$(HDF5.name(g)): column `$k` skipped ($(round(nbytes / 1e6, digits = 1)) MB); " *
+                      "pass a larger `max_column_bytes` to load_file to read it"
+                continue
+            end
             x = read(ds)
             if haskey(g, k * "_index")
                 ends = read(g[k*"_index"])
@@ -115,10 +147,13 @@ function _electrode_table(f, eldset)
     return haskey(f, p) ? f[p] : nothing
 end
 
+# columns never read as metadata: the spikes themselves, references, and per-unit
+# waveforms (NWB names them waveform_mean / waveform_sd; some writers add an "s")
 const UNIT_SKIP = ("spike_times", "id", "electrodes", "waveform_mean", "waveform_sd",
-                   "waveforms", "obs_intervals", "electrode_group")
+                   "waveform_means", "waveform_sds", "waveforms", "obs_intervals",
+                   "electrode_group")
 
-function _load_units(f, u)
+function _load_units(f, u, opts)
     st  = read(u["spike_times"])
     ends = read(u["spike_times_index"])
     n = length(ends)
@@ -126,7 +161,8 @@ function _load_units(f, u)
     starts = [1; ends[1:end-1] .+ 1]
     spikes = [st[a:b] for (a, b) in zip(starts, ends)]
 
-    md = _table_columns(u, n; skip = UNIT_SKIP)
+    md = _table_columns(u, n; skip = (UNIT_SKIP..., opts.skip_columns...),
+                        max_bytes = opts.max_column_bytes)
 
     # electrode of each unit (first one if several) and its electrode-table columns
     if haskey(u, "electrodes")
@@ -140,7 +176,8 @@ function _load_units(f, u)
             tab = _electrode_table(f, u["electrodes"])
             if tab !== nothing && haskey(tab, "id")
                 nrow = length(tab["id"])
-                ecols = _table_columns(tab, nrow; skip = ("id", "group"))
+                ecols = _table_columns(tab, nrow; skip = ("id", "group", opts.skip_columns...),
+                                       max_bytes = opts.max_column_bytes)
                 for (k, v) in ecols
                     key = haskey(md, k) ? Symbol("electrode_", k) : k
                     md[key] = v[el .+ 1]                 # 0-based rows in NWB
@@ -153,10 +190,12 @@ function _load_units(f, u)
     return TsGroup(spikes; ids = ids, pairs(md)...)
 end
 
-function _load_intervals(g)
+function _load_intervals(g, opts)
     s = read(g["start_time"])
     e = read(g["stop_time"])
-    md = _table_columns(g, length(s); skip = ("start_time", "stop_time", "id", "timeseries"))
+    md = _table_columns(g, length(s); skip = ("start_time", "stop_time", "id", "timeseries",
+                                              opts.skip_columns...),
+                        max_bytes = opts.max_column_bytes)
     try
         return IntervalSet(s, e; pairs(md)...)
     catch err
@@ -166,9 +205,14 @@ function _load_intervals(g)
     end
 end
 
-function _load_timeseries(g)
+function _load_timeseries(g, opts)
     d = g["data"]
-    data = HDF5.ismmappable(d) ? HDF5.readmmap(d) : read(d)
+    if opts.remote
+        nbytes = length(d) * sizeof(eltype(d))
+        nbytes > opts.max_column_bytes &&
+            @warn "$(HDF5.name(g)): downloading all $(round(nbytes / 1e9, digits = 2)) GB of a remote time series"
+    end
+    data = !opts.remote && HDF5.ismmappable(d) ? HDF5.readmmap(d) : read(d)
     # HDF5.jl reverses dims: NWB (time, channels) reads as (channels, time)
     data = ndims(data) == 1 ? data : PermutedDimsArray(data, ntuple(i -> ndims(data) + 1 - i, ndims(data)))
     nt = size(data, 1)
