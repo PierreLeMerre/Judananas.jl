@@ -24,6 +24,7 @@ module Judananas
 using Statistics: mean
 using RecipesBase
 using Downloads
+using Random: Random, AbstractRNG
 
 export IntervalSet, Ts, Tsd, TsGroup
 export starts, stops, tot_length, merge_close_intervals,
@@ -32,6 +33,8 @@ export times, time_support, restrict, columns, ids, metadata, rates, rate, index
 export metadata_table, value_counts
 export bin_average, value_from, threshold, compute_perievent, to_tsd,
        time_diff, compute_isi_distribution
+export compute_autocorrelogram, compute_crosscorrelogram, compute_eventcorrelogram,
+       jittered_crosscorrelogram, jitter, spike_time_differences, correlogram_edges
 export load_file, NWBFile, dandi_url
 
 const Metadata = Dict{Symbol,Vector}
@@ -40,6 +43,7 @@ include("intervalset.jl")
 include("timeseries.jl")
 include("tsgroup.jl")
 include("operations.jl")
+include("correlograms.jl")
 include("plotting.jl")
 include("nwb.jl")
 

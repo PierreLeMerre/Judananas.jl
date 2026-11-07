@@ -2,6 +2,7 @@ using Judananas
 using Test
 using RecipesBase
 using HDF5
+using Random: Xoshiro
 
 @testset "Judananas" begin
 
@@ -289,6 +290,105 @@ end
     @test size(h.counts) == (3, 2)
     @test h.counts[:, 1] == [0, 1, 1] && h.counts[:, 2] == [1, 0, 0]
     @test_throws ArgumentError compute_isi_distribution(x; bins = [1.0])
+end
+
+@testset "correlograms" begin
+    ep = IntervalSet(0, 10)
+    ref = Ts([1.0, 2.0]; time_support = ep)
+    target = Ts([1.002, 2.002, 2.5]; time_support = ep)
+
+    @test spike_time_differences(ref, target, 0.6) ≈ [0.002, 0.002, 0.5]
+    @test spike_time_differences([0.0], [0.5, -0.5], 0.5) == [-0.5, 0.5]   # bounds included
+    @test issorted(spike_time_differences(target, ref, 1.0))
+
+    e = correlogram_edges(0.001, 0.005)
+    @test length(e) == 12 && e[1] ≈ -0.0055 && e[end] ≈ 0.0055
+
+    h = compute_crosscorrelogram(ref, target; binsize = 0.001, windowsize = 0.005, counts = true)
+    @test h.lags == (-5:5) .* 0.001 && h.lags[6] == 0.0
+    @test h.values isa Vector{Int}
+    @test h.values[8] == 2 && sum(h.values) == 2                    # lag +2 ms
+    h = compute_crosscorrelogram(ref, target; binsize = 0.001, windowsize = 0.005, norm = false)
+    @test h.values[8] ≈ 2 / (2 * 0.001)
+    h = compute_crosscorrelogram(ref, target; binsize = 0.001, windowsize = 0.005)
+    @test h.values[8] ≈ 1000 / 0.3                                  # / target rate (3 spikes / 10 s)
+
+    # explicit edges, bins [left, right)
+    h = compute_crosscorrelogram(ref, target; edges = [-0.01, 0, 0.01], counts = true)
+    @test h.lags ≈ [-0.005, 0.005] && h.values == [0, 2]
+    @test compute_crosscorrelogram(Ts([0.0]), Ts([0.25]); edges = [0, 0.25, 0.5], counts = true).values == [0, 1]
+    @test_throws ArgumentError compute_crosscorrelogram(ref, target; binsize = 0.001)
+    @test_throws ArgumentError compute_crosscorrelogram(ref, target; edges = [0.1, 0.0])
+
+    # groups: pairs in the order of the group, j relative to i
+    g = TsGroup([ref, target]; ids = [339, 98])
+    h = compute_crosscorrelogram(g; binsize = 0.001, windowsize = 0.005, counts = true)
+    @test h.pairs == [(339, 98)] && h.values[:, 1] == compute_crosscorrelogram(ref, target;
+        binsize = 0.001, windowsize = 0.005, counts = true).values
+    h = compute_crosscorrelogram(g[id = [98, 339]]; binsize = 0.001, windowsize = 0.005, counts = true)
+    @test h.pairs == [(98, 339)] && h.values[4, 1] == 2              # lag -2 ms
+    h = compute_crosscorrelogram((g, g); binsize = 0.001, windowsize = 0.005, counts = true)
+    @test h.pairs == [(339, 339), (339, 98), (98, 339), (98, 98)] && size(h.values) == (11, 4)
+    @test compute_crosscorrelogram(g, g; binsize = 0.001, windowsize = 0.005).pairs == h.pairs
+    @test size(compute_crosscorrelogram(TsGroup([ref]); binsize = 0.001, windowsize = 0.005).values) == (11, 0)
+
+    # autocorrelogram: each spike with itself is not counted
+    x = Ts([1.0, 1.003, 1.006]; time_support = ep)
+    a = compute_autocorrelogram(x; binsize = 0.001, windowsize = 0.005, counts = true)
+    @test a.values[6] == 0 && a.values[3] == 2 && a.values[9] == 2 && sum(a.values) == 4
+    a = compute_autocorrelogram(x; binsize = 0.001, windowsize = 0.005)
+    @test a.values[9] ≈ 2 / (3 * 0.001) / 0.3
+    ag = compute_autocorrelogram(TsGroup([x, ref]; ids = [5, 6]); binsize = 0.001, windowsize = 0.005)
+    @test ag.ids == [5, 6] && ag.values[:, 1] ≈ a.values
+
+    # event correlogram = CCG of the unit relative to the events
+    ev = compute_eventcorrelogram(target, [2.0, 1.0]; binsize = 0.001, windowsize = 0.005, norm = false)
+    @test ev.values ≈ compute_crosscorrelogram(ref, target; binsize = 0.001, windowsize = 0.005,
+                                               norm = false).values
+    evg = compute_eventcorrelogram(g, Ts([1.0, 2.0]); binsize = 0.001, windowsize = 0.005, counts = true)
+    @test evg.ids == [339, 98] && evg.values[8, 2] == 2 && evg.values[6, 1] == 2
+    # with ep, only the events inside it
+    @test sum(compute_eventcorrelogram(target, [1.0, 2.0]; binsize = 0.001, windowsize = 0.005,
+                                       counts = true, ep = IntervalSet(1.5, 3)).values) == 1
+
+    # pairs of spikes from the same epoch only
+    r, t = Ts([0.999]; time_support = ep), Ts([1.002]; time_support = ep)
+    two = IntervalSet([0, 1.001], [1, 2])
+    kw = (binsize = 0.001, windowsize = 0.005, counts = true)
+    @test sum(compute_crosscorrelogram(r, t; kw..., ep = two).values) == 1
+    @test sum(compute_crosscorrelogram(r, t; kw..., ep = two, same_epoch = true).values) == 0
+
+    # shift predictor: epoch k of ref with epoch k + 1 of target, relative to each start
+    trials = IntervalSet([0, 10], [1, 11])
+    r, t = Ts([0.5]; time_support = ep), Ts([10.502]; time_support = IntervalSet(0, 20))
+    h = compute_crosscorrelogram(r, t; kw..., ep = trials, same_epoch = true, epoch_shift = 1)
+    @test h.values[8] == 1 && sum(h.values) == 1
+    @test sum(compute_crosscorrelogram(r, t; kw..., ep = trials, same_epoch = true).values) == 0
+    h = compute_crosscorrelogram(r, t; binsize = 0.001, windowsize = 0.005, norm = false,
+                                 ep = trials, same_epoch = true, epoch_shift = 1)
+    @test h.values[8] ≈ 1 / (1 * 0.001)
+    h = compute_crosscorrelogram(r, t; binsize = 0.001, windowsize = 0.005,
+                                 ep = trials, same_epoch = true, epoch_shift = 1)
+    @test h.values[8] ≈ 1000 / (1 / 2)                               # target rate on the trials
+    @test_throws ArgumentError compute_crosscorrelogram(r, t; kw..., epoch_shift = 1)
+
+    # jitter
+    y = Ts(collect(1.0:1.0:9.0); time_support = ep)
+    j = jitter(y, 0.1; rng = Xoshiro(1))
+    @test issorted(times(j)) && time_support(j) == ep && length(j) == 9
+    @test all(abs.(times(j) .- times(y)) .<= 0.1)
+    @test times(jitter(y, 0.1; rng = Xoshiro(1))) == times(j)        # reproducible
+    @test length(jitter(Ts([0.0, 10.0]; time_support = ep), 1.0; rng = Xoshiro(2))) <= 2
+    gj = jitter(g, 0.01; rng = Xoshiro(3))
+    @test ids(gj) == ids(g) && length.(gj) == length.(g) && time_support(gj) == time_support(g)
+
+    real = compute_crosscorrelogram(ref, target; kw...)
+    jit0 = jittered_crosscorrelogram(ref, target; jitter = 0, n_rep = 3, kw...)
+    @test jit0.values == real.values && eltype(jit0.values) == Float64
+    jm = jittered_crosscorrelogram(ref, target; jitter = 0.002, n_rep = 50, rng = Xoshiro(4), kw...)
+    @test sum(jm.values) ≈ 2 atol = 0.5
+    @test jm.lags == real.lags
+    @test_throws ArgumentError jittered_crosscorrelogram(ref, target; n_rep = 0, kw...)
 end
 
 @testset "plot recipes" begin

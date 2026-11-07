@@ -65,6 +65,27 @@ lfp    = data["LFP/ElectricalSeries"]
 - `value_counts(group, :location)`, `metadata_table(group)` (a Tables.jl table: `DataFrame(metadata_table(group))`)
 - `to_tsd(group)`: all spikes in one `Tsd`, with unit ids as values
 
+## Correlograms
+
+```julia
+kw = (binsize = 0.001, windowsize = 0.02)                 # 1 ms bins, ±20 ms, one bin centered on 0
+acg = compute_autocorrelogram(units; kw...)               # lags × units, acg.ids
+ccg = compute_crosscorrelogram(ref, target; kw...)        # target relative to ref
+ccg = compute_crosscorrelogram(g[id = [339, 98]]; kw...)  # pairs in the order of the group: (339, 98)
+ccg = compute_crosscorrelogram((refs, targets); kw...)    # all (ref, target) pairs
+peth = compute_eventcorrelogram(units, onsets; kw...)
+jit = jittered_crosscorrelogram(ref, target; jitter = 0.025, n_rep = 40, counts = true, kw...)
+```
+
+All return `(lags, edges, values)` (plus `ids` or `pairs` for groups). `norm = true` (default)
+divides the rate by the target's mean rate, `norm = false` gives spikes/s, and `counts = true`
+gives raw numbers of coincidences. `edges = [...]` sets explicit bins. With `ep = trials,
+same_epoch = true`, only pairs of spikes from the same trial are counted, and `epoch_shift = 1`
+gives the shift predictor. Lower-level helpers: `spike_time_differences`, `correlogram_edges`
+and `jitter`.
+
+Unlike pynapple, the pairs of a `TsGroup` follow the group's order, not the order of the ids.
+
 ## Plotting
 
 Plot recipes for Plots.jl are defined through RecipesBase, so Judananas does not depend on Plots itself:
